@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhisperX 服务监控</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            color: #00d4ff;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status-healthy { background: #00c853; color: white; }
+        .status-busy { background: #ff9800; color: white; }
+        .status-error { background: #f44336; color: white; }
+
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .card {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+        }
+        .card-value {
+            font-size: 36px;
+            font-weight: bold;
+            color: #00d4ff;
+        }
+        .card-label {
+            color: #888;
+            margin-top: 5px;
+            font-size: 14px;
+        }
+
+        .section {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .section h2 {
+            color: #00d4ff;
+            margin-bottom: 15px;
+            font-size: 18px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #2a3f5f;
+        }
+        th {
+            color: #888;
+            font-weight: 500;
+        }
+        .priority-high { color: #f44336; }
+        .priority-medium { color: #ff9800; }
+        .priority-low { color: #4caf50; }
+        .task-status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .task-pending { background: #4a4a6a; }
+        .task-running { background: #ff9800; color: white; }
+        .task-completed { background: #00c853; color: white; }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        input[type="number"] {
+            background: #2a3f5f;
+            border: 1px solid #3a5f8f;
+            color: white;
+            padding: 8px 12px;
+            border-radius: 5px;
+            width: 80px;
+        }
+        button {
+            background: #00d4ff;
+            color: #1a1a2e;
+            border: none;
+            padding: 8px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #00b8e6;
+        }
+        .message {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 5px;
+            display: none;
+        }
+        .message-success { background: #00c853; color: white; }
+        .message-error { background: #f44336; color: white; }
+
+        .refresh-info {
+            color: #666;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            WhisperX 语音识别服务
+            <span id="serverStatus" class="status-badge status-healthy">健康</span>
+        </h1>
+
+        <div class="cards">
+            <div class="card">
+                <div class="card-value" id="runningTasks">0</div>
+                <div class="card-label">运行中任务</div>
+            </div>
+            <div class="card">
+                <div class="card-value" id="pendingTasks">0</div>
+                <div class="card-label">队列等待</div>
+            </div>
+            <div class="card">
+                <div class="card-value" id="completedTasks">0</div>
+                <div class="card-label">已完成</div>
+            </div>
+            <div class="card">
+                <div class="card-value" id="maxConcurrent">0</div>
+                <div class="card-label">最大并发</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>并发控制</h2>
+            <div class="controls">
+                <label>最大并发数:</label>
+                <input type="number" id="concurrentInput" min="1" max="10" value="2">
+                <button onclick="updateConfig()">更新</button>
+                <div id="configMessage" class="message"></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>最近任务</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务ID</th>
+                        <th>优先级</th>
+                        <th>状态</th>
+                        <th>创建时间</th>
+                        <th>处理时长</th>
+                    </tr>
+                </thead>
+                <tbody id="taskTable">
+                    <tr><td colspan="5" style="text-align:center;color:#666;">加载中...</td></tr>
+                </tbody>
+            </table>
+            <div class="refresh-info">每 3 秒自动刷新</div>
+        </div>
+    </div>
+
+    <script>
+        function formatTime(timestamp) {
+            if (!timestamp) return '-';
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleTimeString('zh-CN');
+        }
+
+        function formatDuration(seconds) {
+            if (!seconds) return '-';
+            if (seconds < 60) return seconds.toFixed(1) + 's';
+            return (seconds / 60).toFixed(1) + 'm';
+        }
+
+        function getPriorityClass(priority) {
+            switch(priority) {
+                case 1: return 'priority-high';
+                case 2: return 'priority-medium';
+                case 3: return 'priority-low';
+                default: return '';
+            }
+        }
+
+        function getPriorityLabel(priority) {
+            switch(priority) {
+                case 1: return '高优先级';
+                case 2: return '中优先级';
+                case 3: return '低优先级';
+                default: return '未知';
+            }
+        }
+
+        function getStatusClass(status) {
+            return 'task-' + status;
+        }
+
+        async function updateStats() {
+            try {
+                const [statsRes, healthRes] = await Promise.all([
+                    fetch('/api/v1/queue/stats'),
+                    fetch('/health')
+                ]);
+
+                const stats = await statsRes.json();
+                const health = await healthRes.json();
+
+                // 更新状态
+                const statusEl = document.getElementById('serverStatus');
+                if (health.status === 'healthy') {
+                    if (stats.running >= stats.max_concurrent) {
+                        statusEl.textContent = '忙碌';
+                        statusEl.className = 'status-badge status-busy';
+                    } else {
+                        statusEl.textContent = '健康';
+                        statusEl.className = 'status-badge status-healthy';
+                    }
+                } else {
+                    statusEl.textContent = '异常';
+                    statusEl.className = 'status-badge status-error';
+                }
+
+                // 更新卡片
+                document.getElementById('runningTasks').textContent = stats.running;
+                document.getElementById('pendingTasks').textContent = stats.pending;
+                document.getElementById('completedTasks').textContent = stats.completed;
+                document.getElementById('maxConcurrent').textContent = stats.max_concurrent;
+
+                // 更新输入框
+                document.getElementById('concurrentInput').value = stats.max_concurrent;
+
+                // 更新任务列表
+                const tasksRes = await fetch('/api/v1/queue/tasks');
+                const tasks = await tasksRes.json();
+
+                const tbody = document.getElementById('taskTable');
+                if (tasks.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666;">暂无任务</td></tr>';
+                } else {
+                    tbody.innerHTML = tasks.map(task => `
+                        <tr>
+                            <td>${task.task_id.substring(0, 8)}...</td>
+                            <td class="${getPriorityClass(task.priority)}">${getPriorityLabel(task.priority)}</td>
+                            <td><span class="task-status ${getStatusClass(task.status)}">${task.status}</span></td>
+                            <td>${formatTime(task.created_at)}</td>
+                            <td>${formatDuration(task.duration)}</td>
+                        </tr>
+                    `).join('');
+                }
+            } catch (err) {
+                console.error('Failed to update stats:', err);
+            }
+        }
+
+        async function updateConfig() {
+            const input = document.getElementById('concurrentInput');
+            const value = parseInt(input.value);
+            const messageEl = document.getElementById('configMessage');
+
+            if (value < 1 || value > 10) {
+                messageEl.textContent = '请输入 1-10 之间的数字';
+                messageEl.className = 'message message-error';
+                messageEl.style.display = 'block';
+                return;
+            }
+
+            try {
+                const res = await fetch('/api/v1/queue/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({max_concurrent: value})
+                });
+
+                if (res.ok) {
+                    messageEl.textContent = '更新成功';
+                    messageEl.className = 'message message-success';
+                    updateStats();
+                } else {
+                    const data = await res.json();
+                    messageEl.textContent = data.detail || '更新失败';
+                    messageEl.className = 'message message-error';
+                }
+            } catch (err) {
+                messageEl.textContent = '请求失败';
+                messageEl.className = 'message message-error';
+            }
+
+            messageEl.style.display = 'block';
+            setTimeout(() => {
+                messageEl.style.display = 'none';
+            }, 3000);
+        }
+
+        // 初始化
+        updateStats();
+        setInterval(updateStats, 3000);
+    </script>
+</body>
+</html>
