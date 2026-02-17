@@ -34,6 +34,7 @@ class QueuedTask:
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    status: str = "pending"  # pending, running, completed, cancelled
 
     def __lt__(self, other):
         # 优先级队列按优先级排序
@@ -133,6 +134,22 @@ class TaskQueueManager:
             self._tasks[task_id].completed_at = time.time()
         self.release_slot()
 
+    def cancel_task(self, task_id: str) -> bool:
+        """取消任务"""
+        if task_id not in self._tasks:
+            return False
+
+        task = self._tasks[task_id]
+
+        # 只能取消 pending 状态的任务
+        if task.status == "pending":
+            task.status = "cancelled"
+            task.completed_at = time.time()
+            logger.info(f"Task {task_id} cancelled")
+            return True
+
+        return False
+
     def get_task(self, task_id: str) -> Optional[QueuedTask]:
         """获取任务信息"""
         return self._tasks.get(task_id)
@@ -164,21 +181,23 @@ class TaskQueueManager:
         """获取任务列表"""
         tasks = []
         for task in sorted(self._tasks.values(), key=lambda x: x.created_at, reverse=True)[:limit]:
-            status = "pending"
-            if task.completed_at:
-                status = "completed"
-            elif task.started_at:
-                status = "running"
+            # 计算处理时长（已取消的任务没有实际处理时长）
+            duration = None
+            if task.status != "cancelled":
+                if task.started_at and task.completed_at:
+                    duration = task.completed_at - task.started_at
+                elif task.started_at:
+                    duration = time.time() - task.started_at
 
             tasks.append({
                 "task_id": task.task_id,
                 "priority": task.priority,
                 "priority_label": TaskPriority(task.priority).name,
-                "status": status,
+                "status": task.status,
                 "created_at": task.created_at,
                 "started_at": task.started_at,
                 "completed_at": task.completed_at,
-                "duration": (task.completed_at or time.time()) - task.started_at if task.started_at else None,
+                "duration": duration,
             })
         return tasks
 

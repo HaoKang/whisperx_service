@@ -99,3 +99,12 @@ class TaskListItem(BaseModel):
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     duration: Optional[float] = None
+
+
+class CacheStats(BaseModel):
+    hits: int
+    misses: int
+    hit_rate: str
+    size: int
+    max_size: int
+    ttl: int

@@ -25,9 +25,11 @@ from models import (
     QueueStats,
     QueueConfigRequest,
     TaskListItem,
+    CacheStats,
 )
 from whisper_service import get_whisper_service
 from task_queue import get_queue_manager, TaskPriority as QueuePriority
+from result_cache import get_result_cache
 
 # 初始化配置
 config = init_config()
@@ -141,6 +143,20 @@ async def recognize_speech(
                 )
             await f.write(content)
 
+        # 检查缓存
+        cache = get_result_cache()
+        cached_result = cache.get(str(file_path))
+        if cached_result:
+            logger.info(f"Returning cached result for {file_path}")
+            return RecognizeResponse(
+                success=True,
+                task_id=task_id,
+                text=cached_result.get("text"),
+                segments=[Segment(**seg) for seg in cached_result.get("segments", [])],
+                language=cached_result.get("language"),
+                duration=cached_result.get("duration"),
+            )
+
         # 创建任务记录
         tasks[task_id] = {
             "status": TaskStatus.PENDING,
@@ -206,6 +222,18 @@ async def process_recognition(task_id: str):
             text = service.generate_vtt(result.segments)
         elif format == OutputFormat.TEXT:
             text = service.generate_text(result.segments)
+
+        # 缓存原始结果（JSON 格式）
+        cache_result = {
+            "text": result.text,
+            "segments": [seg.model_dump() for seg in result.segments],
+            "language": result.language,
+            "duration": result.duration,
+        }
+
+        # 存储缓存（在文件清理之前）
+        cache = get_result_cache()
+        cache.set(task["file_path"], cache_result)
 
         tasks[task_id] = {
             "status": TaskStatus.COMPLETED,
@@ -405,6 +433,37 @@ async def update_queue_config(config: QueueConfigRequest):
 async def get_queue_tasks(limit: int = 50):
     """获取任务列表"""
     return queue_manager.get_tasks_list(limit)
+
+
+@app.post("/api/v1/queue/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """取消任务"""
+    # 从队列中移除
+    success = queue_manager.cancel_task(task_id)
+
+    # 从任务存储中移除
+    if task_id in tasks:
+        del tasks[task_id]
+
+    if success:
+        return {"success": True, "message": "任务已取消"}
+    else:
+        raise HTTPException(status_code=400, detail="任务无法取消（可能已在执行中）")
+
+
+# ============== 缓存 API ==============
+
+@app.get("/api/v1/cache/stats", response_model=CacheStats)
+async def get_cache_stats():
+    """获取缓存统计"""
+    return get_result_cache().get_stats()
+
+
+@app.post("/api/v1/cache/clear")
+async def clear_cache():
+    """清空缓存"""
+    get_result_cache().clear()
+    return {"success": True, "message": "缓存已清空"}
 
 
 # ============== 监控页面 ==============
