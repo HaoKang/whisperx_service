@@ -54,6 +54,7 @@ class RecognizeResponse(BaseModel):
     language: Optional[str] = None
     duration: Optional[float] = None
     error: Optional[str] = None
+    cached: bool = False  # 是否来自缓存
 
 
 class TaskStatusResponse(BaseModel):
@@ -62,18 +63,22 @@ class TaskStatusResponse(BaseModel):
     result: Optional[RecognitionResult] = None
     error: Optional[str] = None
     progress: Optional[float] = None
+    wait_time: Optional[float] = None  # 等待时间（秒）
 
 
 class HealthResponse(BaseModel):
     status: str
-    version: str = "1.0.0"
+    version: str = "1.1.0"
     model_loaded: bool = False
+    device: Optional[str] = None
+    is_apple_silicon: Optional[bool] = None
 
 
 class ModelInfo(BaseModel):
     name: str
     device: str
     diarize_available: bool = True
+    compute_type: Optional[str] = None
 
 
 class QueueStats(BaseModel):

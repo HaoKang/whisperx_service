@@ -1,4 +1,4 @@
-# WhisperX 服务配置
+# WhisperX 服务配置（针对 Mac Mini M4 Pro 优化）
 
 server:
   host: "0.0.0.0"
@@ -6,23 +6,44 @@ server:
   workers: 1
   reload: false
 
+queue:
+  # 最大并发任务数（M4 Pro 建议 2-4）
+  max_concurrent: 2
+  # 工作线程数（M4 Pro 建议 2-4）
+  worker_threads: 2
+
 whisper:
   # 模型大小: tiny/base/small/medium/large-v2/large-v3
+  # M4 Pro 推荐: base 或 small（平衡速度和精度）
   model: "base"
-  # 运行设备: auto/cuda/cpu
+  # 运行设备: auto/mps/cuda/cpu
+  # M4 Pro 会自动选择 mps（Metal Performance Shaders）
   device: "auto"
+  # 计算类型（M4 Pro 使用 float16）
+  compute_type: "float16"
+  # HuggingFace Token（说话人分离需要）
+  # 获取方式: https://huggingface.co/settings/tokens
+  huggingface_token: null
   # 是否默认启用说话人分离
   diarize: false
   # 语言代码，为空则自动检测
   language: null
-  # 音频批次大小
+  # 音频批次大小（M4 Pro 统一内存可以使用较大值）
   batch_size: 16
+  # 线程数（M4 Pro 性能核心数）
+  threads: 8
 
 storage:
   # 临时文件目录
   temp_dir: "./temp"
   # 最大文件大小 (MB)
   max_file_size: 100
+
+cache:
+  # 最大缓存数量
+  max_size: 100
+  # 缓存有效期（秒），默认 6 小时
+  ttl: 21600
 
 logging:
   level: "INFO"

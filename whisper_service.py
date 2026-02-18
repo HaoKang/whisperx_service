@@ -1,13 +1,12 @@
 import os
 import uuid
-import tempfile
-import shutil
-from pathlib import Path
-from typing import Optional, List, Dict, Any
 import logging
+import platform
+from pathlib import Path
+from typing import Optional, List
 
-import whisperx
 import torch
+import whisperx
 from whisperx.diarize import DiarizationPipeline
 
 from config import get_config
@@ -17,24 +16,53 @@ logger = logging.getLogger(__name__)
 
 
 class WhisperService:
+    """WhisperX 服务（针对 Apple Silicon 优化）"""
+
     def __init__(self):
         self.config = get_config().whisper
         self._model = None
         self._diarize_model = None
+        self._align_model = None
+        self._align_metadata = None
+        self._align_language = None
         self._device = None
         self._model_type = None
-        self._compute_type = getattr(self.config, 'compute_type', 'float32')
-        self._threads = getattr(self.config, 'threads', 10)
+
+        # 检测设备类型
+        self._is_apple_silicon = self._detect_apple_silicon()
+
+        # 使用配置文件中的计算类型，默认 int8（CPU 优化）
+        self._compute_type = getattr(self.config, 'compute_type', 'int8')
+        self._threads = getattr(self.config, 'threads', 8)
 
         # 设置线程数优化性能
         os.environ["OMP_NUM_THREADS"] = str(self._threads)
         os.environ["MKL_NUM_THREADS"] = str(self._threads)
 
+        logger.info(f"WhisperService initialized: Apple Silicon={self._is_apple_silicon}, "
+                    f"compute_type={self._compute_type}, threads={self._threads}")
+
+    def _detect_apple_silicon(self) -> bool:
+        """检测是否为 Apple Silicon"""
+        return (
+            platform.system() == "Darwin" and
+            platform.machine() == "arm64" and
+            torch.backends.mps.is_available()
+        )
+
     @property
     def device(self):
+        """获取运行设备（暂时禁用 MPS，等待 WhisperX 完整支持）"""
         if self._device is None:
             if self.config.device == "auto":
-                self._device = "cuda" if torch.cuda.is_available() else "cpu"
+                # MPS 支持尚不完整，暂时使用 CPU
+                # TODO: 等 WhisperX MPS 支持完善后启用
+                if torch.cuda.is_available():
+                    self._device = "cuda"
+                    logger.info("Using CUDA for GPU acceleration")
+                else:
+                    self._device = "cpu"
+                    logger.info("Using CPU for inference")
             else:
                 self._device = self.config.device
         return self._device
@@ -47,17 +75,25 @@ class WhisperService:
 
         logger.info(f"Loading WhisperX model: {model_name} on {self.device}")
 
-        # 根据配置选择计算类型
-        compute_type = self._compute_type
+        # M4 Pro 优化配置
+        if self._is_apple_silicon and self.device == "mps":
+            # MPS 后端使用 float16
+            compute_type = "float16"
+            # M4 Pro 统一内存，可以使用更大的 batch size
+            batch_size = getattr(self.config, 'batch_size', 16)
+        else:
+            compute_type = self._compute_type
+            batch_size = getattr(self.config, 'batch_size', 8)
 
         self._model = whisperx.load_model(
             model_name,
             self.device,
             compute_type=compute_type,
-            threads=self._threads
+            threads=self._threads,
+            language=self.config.language,
         )
         self._model_type = model_name
-        logger.info(f"Model loaded successfully with compute_type={compute_type}")
+        logger.info(f"Model loaded: compute_type={compute_type}, batch_size={batch_size}")
         return self._model
 
     def load_diarize_model(self):
@@ -70,14 +106,26 @@ class WhisperService:
         if not token:
             raise ValueError("HuggingFace token is required for diarization")
 
-        self._diarize_model = DiarizationPipeline(token=token, device=self.device)
-        logger.info("Diarization model loaded")
+        # M4 Pro 使用 MPS
+        device = self.device
+        self._diarize_model = DiarizationPipeline(token=token, device=device)
+        logger.info(f"Diarization model loaded on {device}")
         return self._diarize_model
 
-        logger.info("Loading diarization model...")
-        self._diarize_model = whisperx.load_align_model(language_code="zh")
-        logger.info("Diarization model loaded")
-        return self._diarize_model
+    def load_align_model(self, language: str):
+        """加载或获取对齐模型（带缓存）"""
+        # 如果已有同语言的对齐模型，直接返回
+        if self._align_model is not None and self._align_language == language:
+            return self._align_model, self._align_metadata
+
+        logger.info(f"Loading align model for language: {language}")
+        self._align_model, self._align_metadata = whisperx.load_align_model(
+            language_code=language,
+            device=self.device
+        )
+        self._align_language = language
+        logger.info("Align model loaded and cached")
+        return self._align_model, self._align_metadata
 
     def recognize(
         self,
@@ -87,7 +135,7 @@ class WhisperService:
         model_name: Optional[str] = None,
     ) -> RecognitionResult:
         """执行语音识别"""
-        # 保存临时文件
+        # 确保临时目录存在
         temp_dir = Path(get_config().storage.temp_dir)
         temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -101,35 +149,39 @@ class WhisperService:
             language = language or self.config.language
 
             # 1. 语音识别
-            logger.info(f"Starting recognition for task {task_id}")
+            logger.info(f"[{task_id}] Starting recognition, language={language}")
             result = model.transcribe(audio_path, language=language)
 
-            # 2. 对齐音频
-            logger.info("Aligning audio...")
-            model_a, metadata = whisperx.load_align_model(
-                language_code=result["language"],
-                device=self.device
-            )
+            detected_language = result.get("language", language)
+            logger.info(f"[{task_id}] Detected language: {detected_language}")
+
+            # 2. 对齐音频（使用缓存的对齐模型）
+            logger.info(f"[{task_id}] Aligning audio...")
+            model_a, metadata = self.load_align_model(detected_language)
             result = whisperx.align(
                 result["segments"], model_a, metadata, audio_path, self.device
             )
 
             # 3. 说话人分离（如果启用）
             if diarize:
-                logger.info("Performing diarization...")
+                logger.info(f"[{task_id}] Performing diarization...")
                 try:
                     # 加载音频
                     audio = whisperx.load_audio(audio_path)
                     # 使用 DiarizationPipeline
                     diarize_model = self.load_diarize_model()
-                    diarize_segments = diarize_model(audio, min_speakers=1, max_speakers=10)
+                    diarize_segments = diarize_model(
+                        audio,
+                        min_speakers=1,
+                        max_speakers=10
+                    )
 
                     # 将说话人信息添加到段落
                     result = whisperx.assign_word_speakers(
                         diarize_segments, result
                     )
                 except Exception as e:
-                    logger.warning(f"Diarization failed: {e}")
+                    logger.warning(f"[{task_id}] Diarization failed: {e}")
 
             # 4. 转换为结果对象
             segments = []
@@ -144,17 +196,18 @@ class WhisperService:
                 )
 
             text = " ".join([seg.text for seg in segments])
+            logger.info(f"[{task_id}] Recognition completed: {len(segments)} segments")
 
             return RecognitionResult(
                 task_id=task_id,
                 text=text,
                 segments=segments,
-                language=result.get("language"),
+                language=detected_language,
                 duration=result.get("duration"),
             )
 
         except Exception as e:
-            logger.error(f"Recognition failed: {e}")
+            logger.error(f"[{task_id}] Recognition failed: {e}")
             raise
 
     def generate_srt(self, segments: List[Segment]) -> str:
@@ -196,6 +249,16 @@ class WhisperService:
         secs = int(seconds % 60)
         millis = int((seconds % 1) * 1000)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+    def get_device_info(self) -> dict:
+        """获取设备信息"""
+        return {
+            "device": self.device,
+            "is_apple_silicon": self._is_apple_silicon,
+            "compute_type": self._compute_type,
+            "threads": self._threads,
+            "mps_available": torch.backends.mps.is_available() if hasattr(torch.backends, 'mps') else False,
+        }
 
 
 # 全局服务实例

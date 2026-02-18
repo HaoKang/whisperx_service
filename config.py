@@ -34,6 +34,11 @@ class StorageConfig(BaseModel):
     max_file_size: int = 100
 
 
+class CacheConfig(BaseModel):
+    max_size: int = 100
+    ttl: int = 6 * 3600  # 6 小时
+
+
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -44,6 +49,7 @@ class Config(BaseModel):
     queue: QueueConfig = QueueConfig()
     whisper: WhisperConfig = WhisperConfig()
     storage: StorageConfig = StorageConfig()
+    cache: CacheConfig = CacheConfig()
     logging: LoggingConfig = LoggingConfig()
 
     @classmethod

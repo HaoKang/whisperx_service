@@ -1,16 +1,19 @@
-import os
-import logging
 import asyncio
+import os
+import uuid
+import time
+import logging
 import tempfile
+import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
-import aiofiles
-import uuid
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
+import aiofiles
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import init_config, get_config
 from models import (
@@ -28,8 +31,10 @@ from models import (
     CacheStats,
 )
 from whisper_service import get_whisper_service
-from task_queue import get_queue_manager, TaskPriority as QueuePriority
+from task_queue import get_queue_manager
 from result_cache import get_result_cache
+from file_utils import validate_audio_file, ALLOWED_EXTENSIONS
+from rate_limiter import get_rate_limiter
 
 # 初始化配置
 config = init_config()
@@ -41,12 +46,97 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 请求追踪 ID
+request_id_var: ContextVar[str] = ContextVar("request_id", default="")
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """请求追踪中间件"""
+
+    async def dispatch(self, request: Request, call_next):
+        # 生成或获取 request ID
+        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
+        request_id_var.set(request_id)
+
+        # 处理请求
+        response = await call_next(request)
+
+        # 添加到响应头
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+class LoggingMiddleware(BaseHTTPMiddleware):
+    """请求日志中间件"""
+
+    async def dispatch(self, request: Request, call_next):
+        start_time = time.time()
+        request_id = request_id_var.get()
+
+        logger.info(f"[{request_id}] {request.method} {request.url.path}")
+
+        response = await call_next(request)
+
+        duration = time.time() - start_time
+        logger.info(
+            f"[{request_id}] {request.method} {request.url.path} "
+            f"- {response.status_code} - {duration:.3f}s"
+        )
+
+        return response
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """请求限流中间件"""
+
+    # 不需要限流的路径
+    EXEMPT_PATHS = {"/health", "/dashboard", "/api/v1/queue/stats", "/api/v1/cache/stats"}
+
+    async def dispatch(self, request: Request, call_next):
+        # 只对 POST 请求限流
+        if request.method != "POST":
+            return await call_next(request)
+
+        # 跳过豁免路径
+        if request.url.path in self.EXEMPT_PATHS:
+            return await call_next(request)
+
+        # 获取客户端 IP
+        client_ip = request.client.host if request.client else "unknown"
+        # 检查代理头
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
+
+        # 检查限流
+        limiter = get_rate_limiter()
+        is_allowed, info = limiter.is_allowed(client_ip, request.url.path)
+
+        if not is_allowed:
+            logger.warning(f"Rate limit hit for {client_ip}: {info}")
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "detail": "请求过于频繁，请稍后重试",
+                    "retry_after": info.get("retry_after", 60),
+                },
+                headers={"Retry-After": str(info.get("retry_after", 60))}
+            )
+
+        return await call_next(request)
+
+
 # 创建 FastAPI 应用
 app = FastAPI(
     title="WhisperX 语音识别服务",
-    description="本地语音识别服务，基于 WhisperX",
-    version="1.0.0",
+    description="本地语音识别服务，基于 WhisperX，针对 Apple Silicon 优化",
+    version="1.1.0",
 )
+
+# 添加中间件
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(LoggingMiddleware)
 
 # 模板渲染
 templates = Jinja2Templates(directory="templates")
@@ -70,7 +160,8 @@ async def startup_event():
     service = get_whisper_service()
     try:
         service.load_model()
-        logger.info("Model loaded on startup")
+        device_info = service.get_device_info()
+        logger.info(f"Model loaded: {device_info}")
     except Exception as e:
         logger.warning(f"Failed to load model on startup: {e}")
 
@@ -78,13 +169,24 @@ async def startup_event():
     asyncio.create_task(queue_processing_loop())
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    """服务关闭时清理资源"""
+    logger.info("Shutting down WhisperX service...")
+    queue_manager.stop()
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """健康检查"""
     service = get_whisper_service()
+    device_info = service.get_device_info()
+
     return HealthResponse(
         status="healthy",
         model_loaded=service._model is not None,
+        device=device_info.get("device"),
+        is_apple_silicon=device_info.get("is_apple_silicon"),
     )
 
 
@@ -93,9 +195,13 @@ async def get_model_info():
     """获取当前模型信息"""
     service = get_whisper_service()
     config = get_config()
+    device_info = service.get_device_info()
+
     return ModelInfo(
         name=config.whisper.model,
-        device=service.device,
+        device=device_info.get("device", "unknown"),
+        diarize_available=bool(config.whisper.huggingface_token),
+        compute_type=device_info.get("compute_type"),
     )
 
 
@@ -110,18 +216,20 @@ async def recognize_speech(
 ):
     """语音识别接口（优先级队列）"""
     task_id = str(uuid.uuid4())
+    request_id = request_id_var.get()
 
     # 验证优先级
     if priority not in [1, 2, 3]:
         priority = 2
 
-    # 验证文件类型
-    allowed_extensions = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm"}
-    file_ext = Path(file.filename).suffix.lower()
-    if file_ext not in allowed_extensions:
+    priority_enum = TaskPriority(priority)
+
+    # 验证文件扩展名
+    file_ext = Path(file.filename).suffix.lower() if file.filename else ""
+    if file_ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的文件类型: {file_ext}。支持的类型: {allowed_extensions}",
+            detail=f"不支持的文件类型: {file_ext}。支持的类型: {ALLOWED_EXTENSIONS}",
         )
 
     # 保存上传的文件
@@ -143,11 +251,21 @@ async def recognize_speech(
                 )
             await f.write(content)
 
+        # 验证文件类型（Magic Number 检测）
+        is_valid, detected_type = validate_audio_file(str(file_path))
+        if not is_valid:
+            file_path.unlink()
+            raise HTTPException(
+                status_code=400,
+                detail="无效的音频文件",
+            )
+        logger.info(f"[{request_id}] File validated: {detected_type}")
+
         # 检查缓存
         cache = get_result_cache()
         cached_result = cache.get(str(file_path))
         if cached_result:
-            logger.info(f"Returning cached result for {file_path}")
+            logger.info(f"[{request_id}] Cache hit for {task_id}")
             return RecognizeResponse(
                 success=True,
                 task_id=task_id,
@@ -155,6 +273,7 @@ async def recognize_speech(
                 segments=[Segment(**seg) for seg in cached_result.get("segments", [])],
                 language=cached_result.get("language"),
                 duration=cached_result.get("duration"),
+                cached=True,
             )
 
         # 创建任务记录
@@ -166,19 +285,22 @@ async def recognize_speech(
             "format": format,
             "model": model,
             "priority": priority,
+            "created_at": time.time(),
         }
 
         # 加入优先级队列
         await queue_manager.enqueue(
             task_id=task_id,
             file_path=str(file_path),
-            priority=QueuePriority(priority),
+            priority=priority_enum,
             language=language,
             diarize=diarize,
             format=format,
             model=model,
             callback=None
         )
+
+        logger.info(f"[{request_id}] Task {task_id} enqueued with priority {priority_enum.name}")
 
         priority_label = {1: "高", 2: "中", 3: "低"}[priority]
         return RecognizeResponse(
@@ -190,19 +312,28 @@ async def recognize_speech(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to process upload: {e}")
+        logger.error(f"[{request_id}] Failed to process upload: {e}")
+        # 清理临时文件
+        if file_path.exists():
+            file_path.unlink()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def process_recognition(task_id: str):
-    """处理识别任务"""
+def process_recognition_sync(task_id: str):
+    """同步处理识别任务（在工作线程中执行）"""
     task = tasks.get(task_id)
     if not task:
+        logger.error(f"Task {task_id} not found")
         return
+
+    request_id = task_id[:8]  # 使用 task_id 作为追踪 ID
 
     try:
         # 更新状态为处理中
         tasks[task_id]["status"] = TaskStatus.PROCESSING
+        tasks[task_id]["started_at"] = time.time()
+
+        logger.info(f"[{request_id}] Processing recognition task")
 
         service = get_whisper_service()
         result = service.recognize(
@@ -244,10 +375,14 @@ async def process_recognition(task_id: str):
                 "language": result.language,
                 "duration": result.duration,
             },
+            "completed_at": time.time(),
         }
 
         # 标记队列任务完成
         queue_manager.complete_task(task_id)
+
+        duration = time.time() - tasks[task_id]["completed_at"]
+        logger.info(f"[{request_id}] Task completed in {duration:.2f}s")
 
         # 清理临时文件
         file_path = Path(task.get("file_path"))
@@ -255,33 +390,48 @@ async def process_recognition(task_id: str):
             file_path.unlink()
 
     except Exception as e:
-        logger.error(f"Recognition failed for task {task_id}: {e}")
+        logger.error(f"[{request_id}] Recognition failed: {e}")
         tasks[task_id] = {
             "status": TaskStatus.FAILED,
             "error": str(e),
+            "completed_at": time.time(),
         }
         # 标记队列任务失败
         queue_manager.fail_task(task_id)
+
+        # 清理临时文件
+        file_path = Path(task.get("file_path", ""))
+        if file_path.exists():
+            file_path.unlink()
 
 
 async def queue_processing_loop():
     """队列处理循环"""
     logger.info("Queue processing loop started")
 
+    loop = asyncio.get_event_loop()
+
     while True:
         try:
             # 从队列获取任务
             task = await queue_manager.dequeue()
 
+            if task is None:
+                # 队列已停止
+                break
+
             logger.info(f"Processing task: {task.task_id}")
 
-            # 在线程池中执行识别任务
-            loop = asyncio.get_event_loop()
+            # 使用线程池执行阻塞的识别任务
             await loop.run_in_executor(
-                None,
-                lambda: asyncio.run(process_recognition(task.task_id))
+                queue_manager._executor,
+                process_recognition_sync,
+                task.task_id
             )
 
+        except asyncio.CancelledError:
+            logger.info("Queue processing loop cancelled")
+            break
         except Exception as e:
             logger.error(f"Error in queue processing: {e}")
             await asyncio.sleep(1)
@@ -310,10 +460,16 @@ async def get_task_status(task_id: str):
             error=task.get("error"),
         )
     else:
+        # 计算等待时间
+        wait_time = None
+        if status == TaskStatus.PENDING:
+            wait_time = time.time() - task.get("created_at", time.time())
+
         return TaskStatusResponse(
             task_id=task_id,
             status=status,
             progress=0.5 if status == TaskStatus.PROCESSING else 0.0,
+            wait_time=wait_time,
         )
 
 
@@ -347,7 +503,7 @@ async def get_result(task_id: str, format: Optional[OutputFormat] = None):
         return PlainTextResponse(result.get("text", ""))
 
 
-# 同步识别接口（简单场景使用）
+# 同步识别接口（适合小文件）
 @app.post("/api/v1/recognize/sync", response_model=RecognizeResponse)
 async def recognize_speech_sync(
     file: UploadFile = File(...),
@@ -356,13 +512,13 @@ async def recognize_speech_sync(
     format: OutputFormat = Form(OutputFormat.JSON),
     model: Optional[str] = Form(None),
 ):
-    """同步语音识别接口（适合小文件）"""
+    """同步语音识别接口（适合小文件，使用线程池避免阻塞）"""
     task_id = str(uuid.uuid4())
+    request_id = request_id_var.get()
 
-    # 验证文件类型
-    allowed_extensions = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm"}
-    file_ext = Path(file.filename).suffix.lower()
-    if file_ext not in allowed_extensions:
+    # 验证文件扩展名
+    file_ext = Path(file.filename).suffix.lower() if file.filename else ""
+    if file_ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
             detail=f"不支持的文件类型: {file_ext}",
@@ -378,13 +534,27 @@ async def recognize_speech_sync(
             content = await file.read()
             await f.write(content)
 
-        # 执行识别
+        # 验证文件类型（Magic Number 检测）
+        is_valid, detected_type = validate_audio_file(str(file_path))
+        if not is_valid:
+            file_path.unlink()
+            raise HTTPException(
+                status_code=400,
+                detail="无效的音频文件",
+            )
+
+        # 使用线程池执行识别（避免阻塞事件循环）
+        loop = asyncio.get_event_loop()
         service = get_whisper_service()
-        result = service.recognize(
-            audio_path=str(file_path),
-            language=language,
-            diarize=diarize,
-            model_name=model,
+
+        result = await loop.run_in_executor(
+            None,
+            lambda: service.recognize(
+                audio_path=str(file_path),
+                language=language,
+                diarize=diarize,
+                model_name=model,
+            )
         )
 
         # 转换格式
@@ -396,6 +566,8 @@ async def recognize_speech_sync(
         elif format == OutputFormat.TEXT:
             text = service.generate_text(result.segments)
 
+        logger.info(f"[{request_id}] Sync recognition completed: {task_id}")
+
         return RecognizeResponse(
             success=True,
             task_id=task_id,
@@ -406,7 +578,7 @@ async def recognize_speech_sync(
         )
 
     except Exception as e:
-        logger.error(f"Recognition failed: {e}")
+        logger.error(f"[{request_id}] Sync recognition failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # 清理临时文件
@@ -423,10 +595,10 @@ async def get_queue_stats():
 
 
 @app.post("/api/v1/queue/config")
-async def update_queue_config(config: QueueConfigRequest):
+async def update_queue_config(config_req: QueueConfigRequest):
     """更新队列配置"""
-    queue_manager.update_max_concurrent(config.max_concurrent)
-    return {"success": True, "max_concurrent": config.max_concurrent}
+    queue_manager.update_max_concurrent(config_req.max_concurrent)
+    return {"success": True, "max_concurrent": config_req.max_concurrent}
 
 
 @app.get("/api/v1/queue/tasks")
@@ -473,6 +645,15 @@ async def dashboard():
     """监控页面"""
     with open("templates/dashboard.html", "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
+
+
+# ============== 设备信息 API ==============
+
+@app.get("/api/v1/device")
+async def get_device_info():
+    """获取设备信息（M4 Pro 优化）"""
+    service = get_whisper_service()
+    return service.get_device_info()
 
 
 if __name__ == "__main__":

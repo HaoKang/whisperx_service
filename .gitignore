@@ -47,3 +47,15 @@ Thumbs.db
 
 # Config (contains sensitive info)
 config.yaml
+
+# Test audio files
+*.m4a
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.webm
+!test/fixtures/*  # 保留测试 fixtures 目录下的文件
+
+# Claude Code
+.claude/
